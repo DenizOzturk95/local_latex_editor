@@ -168,8 +168,7 @@ class LiveTeXEditor(tk.Tk):
             return
         messagebox.showinfo("Saved", f"Saved to {self.current_tex_path}")
 
-    def _compile_now(self):
-        """Force an immediate compile and re-render of the first PDF page."""
+    def _compile_now(self): 
         if not self.current_tex_path:
             messagebox.showinfo("No File", "No .tex file is currently open.")
             return
@@ -231,7 +230,11 @@ class LiveTeXEditor(tk.Tk):
             page = doc.load_page(0)
             pix = page.get_pixmap(dpi=150)
             img_data = pix.tobytes("png")
-            pil_img = Image.open(fitz.open("png", img_data))
+
+            # === FIX: use BytesIO to wrap raw PNG bytes so PIL can open it ===
+            from io import BytesIO
+            pil_img = Image.open(BytesIO(img_data))
+
             tk_img = ImageTk.PhotoImage(pil_img)
         except Exception as e:
             messagebox.showerror("Render Error", f"Failed to render PDF:\n{e}")
@@ -241,7 +244,8 @@ class LiveTeXEditor(tk.Tk):
         self.pdf_canvas.delete("all")
         self.pdf_canvas.configure(scrollregion=(0, 0, pil_img.width, pil_img.height))
         self.pdf_canvas.create_image(0, 0, anchor="nw", image=tk_img)
-        self._img_ref = tk_img  # keep a reference so it doesn't get garbage‐collected
+        self._img_ref = tk_img  # keep a reference so it doesn't get GC’d
+
 
     # -------------------------
     # === AUTO‐SAVE & LIVE COMPILE ===
@@ -266,40 +270,63 @@ class LiveTeXEditor(tk.Tk):
     # -------------------------
     def _update_outline(self):
         """
-        Parse the editor’s text for \\section, \\subsection, etc., and rebuild the Treeview.
-        Clicking on an item will scroll the editor to that line.
+        Scan the editor’s text for \chapter, \section, \subsection, \subsubsection (allowing leading whitespace),
+        and rebuild the Treeview accordingly.  Clicking on an item will jump the editor to that line.
         """
         text = self.tex_text.get("1.0", tk.END)
         lines = text.splitlines()
 
-        # Clear the tree:
+        # 1) Clear any existing items in the outline tree
         for iid in self.outline_tree.get_children():
             self.outline_tree.delete(iid)
 
-        # Regexes for section levels:
-        pattern = re.compile(r"^(?P<indent>\\(sub){0,2}section)\*?\{(?P<title>.*?)\}")
+        # 2) Compile a regex that catches chapter/section/subsection/subsubsection
+        #    ^\s*        → allow any leading spaces/tabs
+        #    \\(chapter|section|subsection|subsubsection)\*?  → the command name (optionally starred)
+        #    \{(.*?)\}   → capture the title itself (lazy, so it stops at the first closing brace)
+        pattern = re.compile(r"^\s*\\(chapter|section|subsection|subsubsection)\*?\{(.*?)\}")
 
-        parent_stack = {0: ""}  # depth → parent IID
+        # parent_stack[depth] will hold the most‐recent Treeview item at that depth
+        # We’ll assign:
+        #   depth=1 → \chapter
+        #   depth=2 → \section
+        #   depth=3 → \subsection
+        #   depth=4 → \subsubsection
+        parent_stack = {0: ""}
 
         for lineno, line in enumerate(lines, start=1):
             m = pattern.match(line)
             if not m:
                 continue
 
-            fullcmd = m.group("indent")  # “\section” or “\subsection” or “\subsubsection”
-            title = m.group("title")
-            if fullcmd.startswith(r"\subsubsection"):
-                depth = 3
-            elif fullcmd.startswith(r"\subsection"):
-                depth = 2
-            else:
-                depth = 1
+            cmd_name = m.group(1)   # "chapter" or "section" or "subsection" or "subsubsection"
+            title    = m.group(2)   # the text inside the braces, e.g. "Introduction"
 
-            iid = f"outline_{lineno}"
+            # Determine depth from the command name:
+            if cmd_name == "chapter":
+                depth = 1
+            elif cmd_name == "section":
+                depth = 2
+            elif cmd_name == "subsection":
+                depth = 3
+            else:  # "subsubsection"
+                depth = 4
+
+            # Build a unique item ID (so multiple sections at the same level don't collide):
+            iid = f"outline_{lineno}"  
+
+            # Parent is the most‐recent item with depth − 1.
             parent = parent_stack.get(depth - 1, "")
-            self.outline_tree.insert(parent, "end", iid, text=title)
+
+            # Insert into the tree.  The “text” shown in the tree is the section heading.
+            # We also store the line number in the hidden “lineno” column via values=(lineno,).
+            self.outline_tree.insert(parent, "end", iid,
+                                      text=title,
+                                      values=(lineno,))
+
+            # Remember that this item is now the latest for its own depth
             parent_stack[depth] = iid
-            self.outline_tree.set(iid, "lineno", str(lineno))
+
 
     def _on_outline_click(self, event=None):
         """When the user clicks a node in the outline, scroll the editor to that line."""
