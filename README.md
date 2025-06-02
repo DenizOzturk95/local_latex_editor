@@ -1,6 +1,8 @@
 # local_latex_editor
 Sharelatex is no good, Overleaf barely works. Meet local latex editor. The same thing but runs on your device. 
 
+![image](https://github.com/user-attachments/assets/60cb2215-f9a6-4af0-99fa-7d5d3d739dc5)
+
 ---
 
 ## Table of Contents
