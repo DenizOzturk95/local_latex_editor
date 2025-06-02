@@ -1,13 +1,12 @@
 import os
 import sys
-import tempfile
+import shutil
 import subprocess
 import threading
-import requests
 import fitz  # PyMuPDF
 from PIL import Image, ImageTk
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog, filedialog
+from tkinter import ttk, messagebox, filedialog
 import re
 from datetime import datetime
 
@@ -23,7 +22,7 @@ class LiveTeXEditor(tk.Tk):
         self.build_dir = None
         self.backup_dir = None
 
-        # For scheduling live‐compile after typing:
+        # For scheduling live‐compile after typing stops:
         self._compile_after_id = None
         # For scheduling periodic backups:
         self._backup_after_id = None
@@ -43,8 +42,8 @@ class LiveTeXEditor(tk.Tk):
         toolbar = ttk.Frame(self, relief=tk.RIDGE, padding=(4, 2))
         toolbar.pack(fill=tk.X, side=tk.TOP)
 
-        btn_open = ttk.Button(toolbar, text="Open URL…", command=self._on_open_url)
-        btn_open.pack(side=tk.LEFT, padx=4)
+        btn_new_template = ttk.Button(toolbar, text="New from Template…", command=self._on_new_from_template)
+        btn_new_template.pack(side=tk.LEFT, padx=4)
 
         btn_save = ttk.Button(toolbar, text="Save Now", command=self._save_now)
         btn_save.pack(side=tk.LEFT, padx=4)
@@ -53,7 +52,6 @@ class LiveTeXEditor(tk.Tk):
         btn_compile.pack(side=tk.LEFT, padx=4)
 
         # === MAIN PANED WINDOW ===
-        # Three panes: Outline | Editor | PDF Preview
         main_pane = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True)
 
@@ -68,22 +66,18 @@ class LiveTeXEditor(tk.Tk):
         vsb_outline.pack(side=tk.RIGHT, fill=tk.Y)
         self.outline_tree.pack(fill=tk.BOTH, expand=True)
         self.outline_tree.bind("<<TreeviewSelect>>", self._on_outline_click)
-
         main_pane.add(left_frame, weight=1)
 
         # 2) CENTER PANE: LaTeX Source Editor
         center_frame = ttk.Frame(main_pane)
         self.tex_text = tk.Text(center_frame, wrap="none", undo=True)
-        # scrollbars for editor
         vsb_tex = ttk.Scrollbar(center_frame, orient=tk.VERTICAL, command=self.tex_text.yview)
         hsb_tex = ttk.Scrollbar(center_frame, orient=tk.HORIZONTAL, command=self.tex_text.xview)
         self.tex_text.configure(yscrollcommand=vsb_tex.set, xscrollcommand=hsb_tex.set)
         vsb_tex.pack(side=tk.RIGHT, fill=tk.Y)
         hsb_tex.pack(side=tk.BOTTOM, fill=tk.X)
         self.tex_text.pack(fill=tk.BOTH, expand=True)
-        # Bind key events to schedule a live compile + outline rebuild
         self.tex_text.bind("<KeyRelease>", self._on_text_modified)
-
         main_pane.add(center_frame, weight=4)
 
         # 3) RIGHT PANE: PDF Preview Canvas
@@ -98,40 +92,41 @@ class LiveTeXEditor(tk.Tk):
         main_pane.add(right_frame, weight=5)
 
     # -------------------------
-    # === BUTTON COMMANDS ===
+    # === TEMPLATE LOADING ===
     # -------------------------
-    def _on_open_url(self):
-        """Ask for a URL to a raw .tex file, fetch it, store as main.tex, and load into the editor."""
-        url = simpledialog.askstring("Open LaTeX URL", "Enter URL of the raw .tex file:")
-        if not url:
+    def _on_new_from_template(self):
+        """
+        Prompt user to choose a .tex template from ./templates directory,
+        copy it to the working directory (as main.tex or original name),
+        then load into the editor, build outline, and compile.
+        """
+        templates_dir = os.path.join(os.getcwd(), "templates")
+        if not os.path.isdir(templates_dir):
+            messagebox.showerror("Templates Not Found", f"No 'templates' directory found at:\n{templates_dir}")
             return
 
-        try:
-            resp = requests.get(url)
-            resp.raise_for_status()
-            tex_source = resp.text
-        except Exception as e:
-            messagebox.showerror("Fetch Error", f"Could not fetch URL:\n{e}")
+        # Ask the user to pick a .tex file from ./templates
+        chosen = filedialog.askopenfilename(
+            title="Select a template",
+            initialdir=templates_dir,
+            filetypes=[("LaTeX files", "*.tex")],
+        )
+        if not chosen:
             return
 
-        # Derive a local filename (e.g. from URL basename, or fallback to main.tex):
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        base = os.path.basename(parsed.path)
-        if base.lower().endswith(".tex"):
-            local_name = base
-        else:
-            local_name = "main.tex"
-
-        # Save into the current working directory:
+        template_basename = os.path.basename(chosen)
+        # Copy template to working directory, naming it "main.tex" (or preserve basename)
         cwd = os.getcwd()
-        self.current_tex_path = os.path.join(cwd, local_name)
+        dest_name = "main.tex"
+        dest_path = os.path.join(cwd, dest_name)
+
         try:
-            with open(self.current_tex_path, "w", encoding="utf-8") as f:
-                f.write(tex_source)
+            shutil.copyfile(chosen, dest_path)
         except Exception as e:
-            messagebox.showerror("File Write Error", f"Could not write {self.current_tex_path}:\n{e}")
+            messagebox.showerror("Copy Error", f"Could not copy template:\n{e}")
             return
+
+        self.current_tex_path = dest_path
 
         # Ensure build/ and backups/ folders exist:
         self.build_dir = os.path.join(cwd, "build")
@@ -139,15 +134,25 @@ class LiveTeXEditor(tk.Tk):
         os.makedirs(self.build_dir, exist_ok=True)
         os.makedirs(self.backup_dir, exist_ok=True)
 
-        # Load the text into the editor, reset modification flag:
+        # Load template content into editor
+        try:
+            with open(self.current_tex_path, "r", encoding="utf-8") as f:
+                tex_source = f.read()
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Could not load {dest_name}:\n{e}")
+            return
+
         self.tex_text.delete("1.0", tk.END)
         self.tex_text.insert("1.0", tex_source)
         self.tex_text.edit_modified(False)
 
-        # Build the initial outline and compile:
+        # Build the outline and compile immediately
         self._update_outline()
         self._compile_now()
 
+    # -------------------------
+    # === SAVE & COMPILE ===
+    # -------------------------
     def _save_now(self):
         """Write the current editor contents immediately to self.current_tex_path."""
         if not self.current_tex_path:
@@ -181,9 +186,7 @@ class LiveTeXEditor(tk.Tk):
         # Copy the .tex into build/temp.tex, then run pdflatex there:
         temp_tex = os.path.join(self.build_dir, "temp.tex")
         try:
-            with open(self.current_tex_path, "r", encoding="utf-8") as src, \
-                 open(temp_tex, "w", encoding="utf-8") as dst:
-                dst.write(src.read())
+            shutil.copyfile(self.current_tex_path, temp_tex)
         except Exception as e:
             messagebox.showerror("Build Copy Error", f"Could not copy .tex into build/:\n{e}")
             return
@@ -197,6 +200,9 @@ class LiveTeXEditor(tk.Tk):
                 stderr=subprocess.PIPE,
                 timeout=20
             )
+        except FileNotFoundError:
+            messagebox.showerror("LaTeX Compile Error", "pdflatex executable not found on PATH.")
+            return
         except Exception as e:
             messagebox.showerror("LaTeX Compile Error", f"Failed to run pdflatex:\n{e}")
             return
@@ -226,7 +232,6 @@ class LiveTeXEditor(tk.Tk):
             pix = page.get_pixmap(dpi=150)
             img_data = pix.tobytes("png")
             pil_img = Image.open(fitz.open("png", img_data))
-            # Convert to a PhotoImage:
             tk_img = ImageTk.PhotoImage(pil_img)
         except Exception as e:
             messagebox.showerror("Render Error", f"Failed to render PDF:\n{e}")
@@ -261,7 +266,7 @@ class LiveTeXEditor(tk.Tk):
     # -------------------------
     def _update_outline(self):
         """
-        Parse the editor’s text for \section, \subsection, etc., and rebuild the Treeview.
+        Parse the editor’s text for \\section, \\subsection, etc., and rebuild the Treeview.
         Clicking on an item will scroll the editor to that line.
         """
         text = self.tex_text.get("1.0", tk.END)
@@ -274,8 +279,7 @@ class LiveTeXEditor(tk.Tk):
         # Regexes for section levels:
         pattern = re.compile(r"^(?P<indent>\\(sub){0,2}section)\*?\{(?P<title>.*?)\}")
 
-        parent_stack = { 0: "" }  # depth → parent IID
-        last_iid = None
+        parent_stack = {0: ""}  # depth → parent IID
 
         for lineno, line in enumerate(lines, start=1):
             m = pattern.match(line)
@@ -292,14 +296,9 @@ class LiveTeXEditor(tk.Tk):
                 depth = 1
 
             iid = f"outline_{lineno}"
-            display_text = f"{title}"
-            # Determine parent based on depth:
             parent = parent_stack.get(depth - 1, "")
-            self.outline_tree.insert(parent, "end", iid, text=display_text)
+            self.outline_tree.insert(parent, "end", iid, text=title)
             parent_stack[depth] = iid
-            last_iid = iid
-
-            # Store the lineno in the item’s “values” so we can jump later:
             self.outline_tree.set(iid, "lineno", str(lineno))
 
     def _on_outline_click(self, event=None):
@@ -311,10 +310,8 @@ class LiveTeXEditor(tk.Tk):
         lineno = self.outline_tree.set(iid, "lineno")
         if lineno:
             try:
-                # Scroll the text widget so that line is visible:
                 target_index = f"{lineno}.0"
                 self.tex_text.see(target_index)
-                # Also move the insert cursor there:
                 self.tex_text.mark_set("insert", target_index)
                 self.tex_text.focus()
             except Exception:
@@ -342,7 +339,6 @@ class LiveTeXEditor(tk.Tk):
                 fullpath = os.path.join(self.backup_dir, fname)
                 with open(fullpath, "w", encoding="utf-8") as f:
                     f.write(content)
-                # print(f"[Backup saved to {fullpath}]")  # (optional console log)
             except Exception as e:
                 print(f"Backup error: {e}", file=sys.stderr)
 
